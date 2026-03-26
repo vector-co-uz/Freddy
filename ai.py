@@ -1,49 +1,69 @@
-"""
-Install the Google AI Python SDK
+import sqlite3
+import json
+import time
+from google import genai
+import prompts
+import config # Импортируем наш новый конфиг
 
-$ pip install google-generativeai
+# Инициализация Gemini
+client = genai.Client(api_key=config.GEMINI_API_KEY)
 
-See the getting started guide for more information:
-https://ai.google.dev/gemini-api/docs/get-started/python
-"""
+def init_db():
+    conn = sqlite3.connect('chat_history.db')
+    curr = conn.cursor()
+    curr.execute('CREATE TABLE IF NOT EXISTS history (user_id TEXT PRIMARY KEY, messages TEXT)')
+    conn.commit()
+    conn.close()
 
-import os
+init_db()
 
-import google.generativeai as genai
+def get_history(user_id):
+    try:
+        conn = sqlite3.connect('chat_history.db')
+        curr = conn.cursor()
+        curr.execute("SELECT messages FROM history WHERE user_id = ?", (str(user_id),))
+        row = curr.fetchone()
+        conn.close()
+        return json.loads(row[0]) if row else []
+    except: return []
 
-genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+def save_history(user_id, history):
+    conn = sqlite3.connect('chat_history.db')
+    curr = conn.cursor()
+    history = history[-config.HISTORY_LIMIT:] # Берем лимит из конфига
+    curr.execute("INSERT OR REPLACE INTO history (user_id, messages) VALUES (?, ?)",
+                 (str(user_id), json.dumps(history)))
+    conn.commit()
+    conn.close()
 
-# Create the model
-# See https://ai.google.dev/api/python/google/generativeai/GenerativeModel
-generation_config = {
-    "temperature": 1,
-    "top_p": 0.95,
-    "top_k": 64,
-    "max_output_tokens": 8192,
-    "response_mime_type": "text/plain",
-}
+def send_message_to_user(user_id, message):
+    msg_lower = message.lower().strip()
+    
+    # 1. Сначала FAQ
+    for key, ans in prompts.FAQ_DATA.items():
+        if key in msg_lower: return ans
 
-with open("ai_instructions.txt") as f:
-    ai_instructions = f.read()
+    # 2. ИИ
+    history = get_history(user_id)
+    history.append({"role": "user", "parts": [{"text": message}]})
 
-model = genai.GenerativeModel(
-    model_name="gemini-1.5-flash",  # gemini-1.5-pro keeps throwing an internal error idk why
-    generation_config=generation_config,
-    # safety_settings = Adjust safety settings
-    # See https://ai.google.dev/gemini-api/docs/safety-settings
-
-
-    system_instruction=ai_instructions,
-)
-
-# Every user has his own chat history here
-# every time you redeploy the bot, it will start a new chat for every user.
-# I don't know if this noticeably affects the memory when dealing with a lot of users
-chat_sessions = {}
-
-
-def send_message_to_user(user_id, message) -> str:
-    if not chat_sessions.get(user_id):
-        chat_sessions[user_id] = model.start_chat()
-
-    return chat_sessions[user_id].send_message(message).text
+    for attempt in range(2):
+        try:
+            response = client.models.generate_content(
+                model=config.MODEL_NAME, # Берем имя модели из конфига
+                contents=history,
+                config={
+                    "system_instruction": prompts.SYSTEM_INSTRUCTIONS["default"],
+                    "temperature": 0.2,
+                }
+            )
+            ai_text = response.text.strip()
+            history.append({"role": "model", "parts": [{"text": ai_text}]})
+            save_history(user_id, history)
+            return ai_text
+        except Exception as e:
+            if "429" in str(e):
+                time.sleep(20)
+                continue
+            return "Ошибка связи."
+    return "Лимит исчерпан."

@@ -1,40 +1,46 @@
-import os
-import logging
+import time
+import asyncio
 from telegram import Update
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
 import ai
+import config # Импортируем конфиг
 
-# Enable logging
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
-# set higher logging level for httpx to avoid all GET and POST requests being logged
-logging.getLogger("httpx").setLevel(logging.WARNING)
-
-logger = logging.getLogger(__name__)
-
-BOT_TOKEN = os.getenv('BOT_TOKEN')
-BUSINESS_CHAT_ID = os.getenv('BUSINESS_CHAT_ID')
+user_buffers = {}
+last_owner_activity = 0
 
 async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # To prevent processing messages from you
-    if BUSINESS_CHAT_ID == str(update.effective_user.id):
+    global last_owner_activity
+    if not update.business_message: return
+
+    user_id = update.business_message.from_user.id
+    current_time = time.time()
+
+    # Проверка владельца (из конфига)
+    if str(update.effective_user.id) == config.BUSINESS_CHAT_ID:
+        last_owner_activity = current_time
         return
 
-    text = update.business_message.text
-    ai_response = ai.send_message_to_user(update.business_message.from_user.id, text)
-    await update.business_message.reply_text(ai_response)
+    # Проверка спячки (из конфига)
+    if current_time - last_owner_activity < config.OWNER_OFFLINE_THRESHOLD:
+        return
 
+    # Накопление
+    if user_id not in user_buffers: user_buffers[user_id] = []
+    user_buffers[user_id].append(update.business_message.text)
+
+    await asyncio.sleep(config.DEBOUNCE_TIME)
+
+    if user_id in user_buffers and user_buffers[user_id]:
+        full_msg = "\n".join(user_buffers.pop(user_id))
+        response = ai.send_message_to_user(user_id, full_msg)
+        await update.business_message.reply_text(response)
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
-    text_handler = MessageHandler(filters.TEXT & filters.UpdateType.BUSINESS_MESSAGE, text_message_handler)
-
-    app.add_handler(text_handler)
-
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
+    app = Application.builder().token(config.BOT_TOKEN).build()
+    app.add_handler(MessageHandler(filters.TEXT & filters.UpdateType.BUSINESS_MESSAGE, text_message_handler))
+    print("Vector Assistant запущен через config.py")
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
